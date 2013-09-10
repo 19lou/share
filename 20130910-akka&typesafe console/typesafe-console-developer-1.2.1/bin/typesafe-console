@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2013 Typesafe, Inc. <http://www.typesafe.com>
+#
+# Start script for Typesafe Console
+
+# flags
+unset debug_command
+
+# get the source location for this script; handles symlinks
+function get_script_path {
+  local source="${BASH_SOURCE[0]}"
+  while [ -h "$source" ] ; do
+    local linked="$(readlink "$source")"
+    local dir="$(cd -P $(dirname "$source") && cd -P $(dirname "$linked") && pwd)"
+    source="$dir/$(basename "$linked")"
+  done
+  echo ${source}
+}
+
+# script details
+declare -r script_path=$(get_script_path)
+declare -r script_name=$(basename "$script_path")
+declare -r script_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
+
+# print usage info
+function usage {
+  cat <<EOM
+Usage: ${script_name} atmos|ui [options]
+  atmos      Start the Atmos collector and analysis
+  ui         Start the Console user interface
+  -port      Specify the Atmos API or Console UI port
+  -X*|-D*    Override or pass-through JVM options
+  -help      Print this usage message
+EOM
+}
+
+# directories
+declare -r base_dir="$(cd "$script_dir/.." && pwd)"
+declare -r conf_dir="$base_dir/conf"
+declare -r lib_dir="$base_dir/lib"
+
+# debug command before executing
+function exec_command {
+  if [ -n "$debug_command" ] ; then
+    echo "exec command:"
+    for arg in "$@"; do echo "$arg"; done
+    echo ""
+  fi
+  "$@"
+}
+
+# arguments
+unset atmos ui
+declare port=""
+declare -a java_args
+declare -a args
+
+# process arguments
+while [[ $# -gt 0 ]] ; do
+  case "$1" in
+    -help) usage; exit 0 ;;
+
+    -debug-command) debug_command=1; shift ;;
+
+    -client | -server)
+      java_args=("${java_args[@]}" "$1")
+      shift ;;
+
+    -D* | -X*)
+      java_args=("${java_args[@]}" "$1")
+      shift ;;
+
+    atmos) atmos=1; shift ;;
+    ui) ui=1; shift ;;
+
+    -port) port="$2"; shift 2 ;;
+
+    *)
+      args=("${args[@]}" "$1")
+      shift ;;
+  esac
+done
+
+# reset "$@"
+set -- "${args[@]}"
+
+# unknown arguments
+if [[ $# -gt 0 ]] ; then
+  echo "[error] Unknown arguments: $@"
+  usage
+  exit 1
+fi
+
+# default ports
+[[ -n "$atmos" && -z "$port" ]] && port=8660
+[[ -n "$ui" && -z "$port" ]] && port=9900
+
+# allow setting of java command
+if [[ -z "$JAVACMD" && -n "$JAVA_HOME" && -x "$JAVA_HOME/bin/java" ]]; then
+  JAVACMD="$JAVA_HOME/bin/java"
+fi
+declare -r java_cmd="${JAVACMD:=java}"
+
+# overridable java options
+declare optMode=""
+declare optXms=""
+declare optXmx=""
+declare optXXMaxPermSize=""
+
+# process java options
+# allows overriding defaults in JAVA_OPTS, ATMOS_OPTS, TYPESAFE_CONSOLE_OPTS or -D|-X args
+declare env_opts=""
+[[ -n "$atmos" ]] && env_opts="$ATMOS_OPTS"
+[[ -n "$ui" ]] && env_opts="$TYPESAFE_CONSOLE_OPTS"
+declare all_opts=($JAVA_OPTS $env_opts ${java_args[@]})
+declare -a other_opts
+for opt in ${all_opts[@]} ; do
+  case "$opt" in
+    -client) optMode="-client" ;;
+    -server) optMode="-server" ;;
+    -Xms*) optXms="$opt" ;;
+    -Xmx*) optXmx="$opt" ;;
+    -XX:MaxPermSize*) optXXMaxPermSize="$opt" ;;
+    *) other_opts=("${other_opts[@]}" "$opt") ;;
+  esac
+done
+
+# set defaults where undefined
+[[ -z "$optMode" ]] && optMode="-server"
+[[ -z "$optXms" && -z "$optXmx" ]] && optXms="-Xms512m" && optXmx="-Xmx512m"
+[[ -z "$optXXMaxPermSize" ]] && optXXMaxPermSize="-XX:MaxPermSize=256m"
+
+# combined java options
+declare java_options=("$optMode" $optXms $optXmx $optXXMaxPermSize ${other_opts[@]})
+
+# check cygwin
+declare cygwin=false
+if [[ "$OSTYPE" == "cygwin" ]]; then
+  cygwin=true
+fi
+
+# create platform-specific path
+function create_classpath {
+  local cp="$1"
+  if $cygwin ; then
+    cp="$(cygpath --windows --path "$cp")"
+  fi
+  echo $cp
+}
+
+# create platform-specific path
+function create_path {
+  local path="$1"
+  if $cygwin ; then
+    path="$(cygpath --windows "$path")"
+  fi
+  echo $path
+}
+
+declare -r var_dir=$(create_path "${base_dir}/var")
+mkdir -p "$var_dir"
+
+if [ -n "$atmos" ] ; then
+  declare -r atmos_classpath=$(create_classpath "${conf_dir}/atmos:${lib_dir}/atmos/atmos.jar")
+  exec_command \
+    "$java_cmd" \
+    "${java_options[@]}" \
+    "-Duser.dir=$var_dir" \
+    -Dquery.http.port=$port \
+    -classpath "$atmos_classpath" \
+    com.typesafe.atmos.AtmosDev
+elif [ -n "$ui" ] ; then
+  declare -r console_classpath=$(create_classpath "${conf_dir}/console:${lib_dir}/console/console.jar")
+  exec_command \
+    "$java_cmd" \
+    "${java_options[@]}" \
+    "-Duser.dir=$var_dir" \
+    -Dhttp.port=$port \
+    -Dlogger.resource=/logback-console.xml \
+    -classpath "$console_classpath" \
+    play.core.server.NettyServer
+else
+  echo "[error] Either atmos or ui modules need to be specified"
+  usage
+  exit 1
+fi
